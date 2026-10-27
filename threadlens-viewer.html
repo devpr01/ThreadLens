@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>ThreadLens timeline</title>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600&display=swap" rel="stylesheet">
+<style>
+:root{box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px);color-scheme:light;
+--bg:#eef1f5;--panel:#fff;--ink:#1b2430;--mute:#5d6b7c;--line:#d5dbe3;--run:#1f9d74;--ready:#e0a21b;--block:#d64550;--sleep:#5b7fb5;--idle:#9aa6b5}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){color-scheme:dark;--bg:#131a23;--panel:#1b2430;--ink:#e6ebf2;--mute:#93a1b3;--line:#2c3846;--run:#34c394;--ready:#e8b43f;--block:#ef6670;--sleep:#7b9ed1;--idle:#6d7b8d}}
+:root[data-theme="dark"]{color-scheme:dark;--bg:#131a23;--panel:#1b2430;--ink:#e6ebf2;--mute:#93a1b3;--line:#2c3846;--run:#34c394;--ready:#e8b43f;--block:#ef6670;--sleep:#7b9ed1;--idle:#6d7b8d}
+html{scroll-padding-top:env(safe-area-inset-top,0px)}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:400 15px/1.5 "IBM Plex Sans",system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:1100px;margin:0 auto;padding:20px 14px 40px;display:grid;gap:14px}
+h1{font-size:26px;margin:0;letter-spacing:-.01em}
+h2{font-size:17px;margin:0 0 4px}
+.sub,.hint,#desc{color:var(--mute);margin:2px 0}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:14px}
+.bar{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+select,button{font:inherit;color:var(--ink);background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:6px 10px;cursor:pointer}
+button.primary{background:var(--sleep);border-color:var(--sleep);color:#fff;font-weight:600}
+select:focus-visible,button:focus-visible,summary:focus-visible{outline:2px solid var(--sleep);outline-offset:2px}
+dl{display:flex;flex-wrap:wrap;gap:10px 26px;margin:12px 0 0}
+dl div{min-width:90px}dt{color:var(--mute);font-size:13px}dd{margin:0;font-size:20px;font-weight:600}
+.tools{display:flex;gap:6px;margin-bottom:8px}
+#wrap{position:relative;width:100%}
+canvas{display:block;width:100%;touch-action:pan-y;cursor:grab}
+canvas:active{cursor:grabbing}
+.legend{list-style:none;display:flex;flex-wrap:wrap;gap:6px 18px;padding:0;margin:10px 0 4px;font-size:13px}
+.legend i{display:inline-block;width:12px;height:12px;border-radius:2px;margin-right:6px;vertical-align:-1px}
+#tip{position:absolute;pointer-events:none;background:var(--ink);color:var(--bg);padding:6px 9px;border-radius:6px;font-size:13px;display:none;max-width:260px;z-index:5}
+#err{color:var(--block);margin:0}
+.over{outline:2px dashed var(--sleep);outline-offset:-6px}
+pre{overflow-x:auto;font-size:13px;margin:10px 0 0}
+</style>
+</head>
+<body>
+<main>
+<header>
+<h1>ThreadLens timeline</h1>
+<p class="sub">See what each thread was doing, and how busy the CPU really was.</p>
+</header>
+<section class="bar">
+<label>Sample <select id="sel"></select></label>
+<button id="open" class="primary" type="button">Open trace file</button>
+<input id="file" type="file" accept=".json,application/json" hidden>
+<span class="hint">or drop a .json file anywhere on the page</span>
+</section>
+<p id="err" role="alert"></p>
+<section class="card">
+<h2 id="tt"></h2>
+<p id="desc"></p>
+<dl id="stats"></dl>
+</section>
+<section class="card">
+<div class="tools">
+<button id="zi" type="button" aria-label="Zoom in">+</button>
+<button id="zo" type="button" aria-label="Zoom out">−</button>
+<button id="zr" type="button">Show all</button>
+</div>
+<div id="wrap"><canvas id="cv" role="img" aria-label="Timeline with one lane per thread and a CPU utilization graph below"></canvas><div id="tip"></div></div>
+<ul class="legend" id="legend"></ul>
+<p class="hint">Scroll to zoom, drag to pan, hover a bar for details.</p>
+</section>
+<details class="card">
+<summary>Trace format (version 1)</summary>
+<pre>{
+  "version": 1,
+  "name": "My trace",
+  "description": "What to notice (optional)",
+  "durationMs": 1000,
+  "cores": 4,
+  "threads": [
+    { "id": 1, "name": "Pool 1",
+      "segments": [
+        { "s": 0, "e": 120, "state": "running", "note": "optional" },
+        { "s": 120, "e": 400, "state": "blocked", "note": "lock(_gate)" }
+      ] }
+  ]
+}
+states: running | ready | blocked | sleeping | idle
+Gaps between segments are drawn as idle.</pre>
+</details>
+</main>
+<script>
+const $=s=>document.querySelector(s);
+const SC={running:'--run',ready:'--ready',blocked:'--block',sleeping:'--sleep',idle:'--idle'};
+const SN={running:'Running on a CPU core',ready:'Ready, waiting for a free core',blocked:'Blocked on a lock',sleeping:'Sleeping or waiting, thread held',idle:'Idle, thread parked'};
+const cv=$('#cv'),ctx=cv.getContext('2d'),tip=$('#tip');
+const LANE=26,GAP=5,TOP=26,CPUH=72;
+let tr,v0=0,v1=1,bins=[],bw=1,W=0,H=0,dpr=1,hov=null,drag=null;
+
+const T=(id,name,a)=>({id,name,segments:a.map(([s,e,state,note])=>({s,e,state,note}))});
+function rr(n,cores,work,q){const g=Array.from({length:n},()=>[]),rem=Array(n).fill(work),rs=Array(n).fill(0),ready=[...Array(n).keys()],free=Array(cores).fill(0);
+while(ready.length){let c=free.indexOf(Math.min(...free)),i=ready.shift(),st=Math.max(free[c],rs[i]),d=Math.min(q,rem[i]);
+if(st>rs[i])g[i].push([rs[i],st,'ready','queued for a core']);g[i].push([st,st+d,'running']);rem[i]-=d;free[c]=rs[i]=st+d;if(rem[i]>0)ready.push(i)}
+return g.map((a,i)=>T(i+1,'Thread '+(i+1),a))}
+const SAMPLES=[
+{name:'Thread.Sleep × 6 on the thread pool',description:'Six work items each call Thread.Sleep(800). CPU use is almost zero, yet the threads are all held. Only 4 pool threads exist at first, so two items wait until the pool slowly adds a thread. Total time is about 1.6 s for 0.8 s of "work".',durationMs:1700,cores:4,threads:[
+T(1,'Main',[[0,30,'running'],[30,1660,'sleeping','Task.WaitAll'],[1660,1680,'running']]),
+T(2,'Pool 1',[[30,34,'running'],[34,834,'sleeping','Thread.Sleep(800)'],[840,844,'running'],[844,1644,'sleeping','item 6, Thread.Sleep(800)']]),
+T(3,'Pool 2',[[30,34,'running'],[34,834,'sleeping','Thread.Sleep(800)']]),
+T(4,'Pool 3',[[30,34,'running'],[34,834,'sleeping','Thread.Sleep(800)']]),
+T(5,'Pool 4',[[30,34,'running'],[34,834,'sleeping','Thread.Sleep(800)']]),
+T(6,'Pool 5 (injected)',[[530,534,'running','pool added a thread'],[534,1334,'sleeping','item 5, Thread.Sleep(800)']])]},
+{name:'await Task.Delay × 6',description:'The same six waits written with await Task.Delay(800). No thread is held while waiting: one pool thread starts all the timers in microseconds, then everything is idle until the timers fire. Finishes in about 0.85 s.',durationMs:1700,cores:4,threads:[
+T(1,'Main',[[0,30,'running'],[836,846,'running']]),
+T(2,'Pool 1',[[30,36,'running','start 6 timers'],[830,834,'running','continuations']]),
+T(3,'Pool 2',[[832,836,'running','continuations']])]},
+{name:'Four threads fighting over one lock',description:'Each thread does 20 ms of work, then needs the same lock for 150 ms. Four threads exist but only one runs at a time after the first 20 ms, so CPU use drops to 25% of 4 cores while three threads sit blocked.',durationMs:640,cores:4,threads:[
+T(1,'Worker 1',[[0,20,'running'],[20,170,'running','holds lock(_gate)']]),
+T(2,'Worker 2',[[0,20,'running'],[20,170,'blocked','waiting for _gate'],[170,320,'running','holds lock(_gate)']]),
+T(3,'Worker 3',[[0,20,'running'],[20,320,'blocked','waiting for _gate'],[320,470,'running','holds lock(_gate)']]),
+T(4,'Worker 4',[[0,20,'running'],[20,470,'blocked','waiting for _gate'],[470,620,'running','holds lock(_gate)']])]},
+{name:'6 CPU-bound threads on 4 cores',description:'Six busy loops, 400 ms of work each, on 4 cores with a 50 ms time slice. The CPU is saturated at 100%, and the amber bars show threads that are ready but must wait for a core. More threads than cores adds waiting, not speed.',durationMs:620,cores:4,threads:rr(6,4,400,50)}];
+
+SAMPLES.forEach((s,i)=>$('#sel').add(new Option(s.name,i)));
+$('#legend').innerHTML=Object.keys(SN).map(k=>`<li><i style="background:var(${SC[k]})"></i>${SN[k]}</li>`).join('');
+
+function load(t){
+ if(!t||!Array.isArray(t.threads))throw new Error('This file has no "threads" array. See the trace format below.');
+ t.threads.forEach((th,i)=>{th.name=th.name||('Thread '+(th.id??i+1));th.segments=(th.segments||[]).filter(s=>s.e>s.s).sort((a,b)=>a.s-b.s)});
+ let mx=0;t.threads.forEach(th=>th.segments.forEach(s=>mx=Math.max(mx,s.e)));
+ t.duration=t.durationMs||mx||1;t.cores=t.cores||1;tr=t;
+ const N=Math.min(2000,Math.max(100,Math.ceil(t.duration)));bw=t.duration/N;bins=new Array(N).fill(0);
+ let cpu=0,idle=0,peak=0;
+ t.threads.forEach(th=>th.segments.forEach(s=>{const d=s.e-s.s;if(s.state==='running'){cpu+=d;
+  for(let b=Math.floor(s.s/bw);b<=Math.min(N-1,Math.floor((s.e-1e-9)/bw));b++)bins[b]+=(Math.min(s.e,(b+1)*bw)-Math.max(s.s,b*bw))/bw}
+  else if(s.state==='blocked'||s.state==='sleeping')idle+=d}));
+ peak=Math.max(...bins);
+ $('#tt').textContent=t.name||'Untitled trace';$('#desc').textContent=t.description||'';
+ const st=[['Duration',Math.round(t.duration)+' ms'],['Cores',t.cores],['Threads',t.threads.length],['CPU time',Math.round(cpu)+' ms'],
+  ['Average CPU use',Math.round(100*cpu/(t.duration*t.cores))+'%'],['Peak threads running',Math.round(peak*10)/10],['Thread time held but idle',Math.round(idle)+' ms']];
+ $('#stats').innerHTML=st.map(([k,v])=>`<div><dt>${k}</dt><dd>${v}</dd></div>`).join('');
+ $('#err').textContent='';v0=0;v1=t.duration;fit()}
+
+const labelW=()=>W<560?76:132;
+function fit(){W=$('#wrap').clientWidth;dpr=window.devicePixelRatio||1;H=TOP+tr.threads.length*(LANE+GAP)+CPUH+40;
+ cv.width=W*dpr;cv.height=H*dpr;cv.style.height=H+'px';draw()}
+function draw(){
+ const cs=getComputedStyle(document.documentElement),col=n=>cs.getPropertyValue(n).trim();
+ const L=labelW(),R=W-8,X=t=>L+(t-v0)/(v1-v0)*(R-L);
+ ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,W,H);ctx.font='12px "IBM Plex Sans",system-ui,sans-serif';ctx.textBaseline='alphabetic';
+ const span=v1-v0,steps=[1,2,5,10,20,50,100,200,500,1000,2000,5000],step=steps.find(s=>s/span*(R-L)>=80)||5000;
+ ctx.fillStyle=col('--mute');ctx.strokeStyle=col('--line');ctx.lineWidth=1;ctx.textAlign='center';
+ for(let t=Math.ceil(v0/step)*step;t<=v1;t+=step){const x=Math.round(X(t))+.5;ctx.beginPath();ctx.moveTo(x,TOP-6);ctx.lineTo(x,H-34);ctx.stroke();ctx.fillText(t+' ms',x,14)}
+ const n=tr.threads.length;
+ tr.threads.forEach((th,i)=>{const y=TOP+i*(LANE+GAP);
+  ctx.textAlign='left';ctx.fillStyle=col('--ink');ctx.fillText(th.name,8,y+LANE/2+4,L-14);
+  ctx.save();ctx.beginPath();ctx.rect(L,y,R-L,LANE);ctx.clip();
+  ctx.globalAlpha=.25;ctx.fillStyle=col('--idle');ctx.fillRect(L,y,R-L,LANE);ctx.globalAlpha=1;
+  th.segments.forEach(s=>{if(s.e<v0||s.s>v1||s.state==='idle')return;const a=X(s.s),b=X(s.e);ctx.fillStyle=col(SC[s.state]||'--idle');ctx.fillRect(a,y,Math.max(1.5,b-a),LANE)});
+  ctx.restore()});
+ const y0=TOP+n*(LANE+GAP)+10;
+ ctx.textAlign='left';ctx.fillStyle=col('--ink');ctx.fillText('CPU use',8,y0+14);ctx.fillStyle=col('--mute');ctx.fillText('of '+tr.cores+(tr.cores>1?' cores':' core'),8,y0+30,L-14);
+ ctx.fillStyle=col('--line');ctx.globalAlpha=.4;ctx.fillRect(L,y0,R-L,CPUH);ctx.globalAlpha=1;
+ ctx.fillStyle=col('--run');
+ for(let px=L;px<R;px++){const t=v0+(px-L)/(R-L)*span,u=Math.min(1,(bins[Math.min(bins.length-1,Math.max(0,Math.floor(t/bw)))]||0)/tr.cores);ctx.fillRect(px,y0+CPUH*(1-u),1,CPUH*u)}
+ ctx.fillStyle=col('--mute');ctx.textAlign='right';ctx.fillText('100%',R-4,y0+12);
+ if(hov){const x=X(hov.t);ctx.strokeStyle=col('--ink');ctx.globalAlpha=.5;ctx.beginPath();ctx.moveTo(x+.5,TOP-6);ctx.lineTo(x+.5,y0+CPUH);ctx.stroke();ctx.globalAlpha=1}}
+
+function pos(e){const r=cv.getBoundingClientRect(),L=labelW();return{x:e.clientX-r.left,y:e.clientY-r.top,f:(e.clientX-r.left-L)/(W-8-L)}}
+cv.addEventListener('pointermove',e=>{const p=pos(e);
+ if(drag){const dt=(p.x-drag.x)/(W-8-labelW())*(drag.b-drag.a);v0=drag.a-dt;v1=drag.b-dt;clamp();draw();tip.style.display='none';return}
+ if(p.f<0||p.f>1){hov=null;tip.style.display='none';draw();return}
+ const t=v0+p.f*(v1-v0),i=Math.floor((p.y-TOP)/(LANE+GAP));hov={t};let html='';
+ if(i>=0&&i<tr.threads.length&&(p.y-TOP)%(LANE+GAP)<LANE){const th=tr.threads[i],s=th.segments.find(s=>t>=s.s&&t<s.e);
+  html=`<b>${th.name}</b><br>`+(s?`${SN[s.state]||s.state}<br>${s.s}–${s.e} ms (${+(s.e-s.s).toFixed(1)} ms)`+(s.note?`<br>${s.note}`:''):`Idle at ${Math.round(t)} ms`)}
+ else if(i>=tr.threads.length){const u=bins[Math.min(bins.length-1,Math.floor(t/bw))]||0;html=`${Math.round(t)} ms<br>${+u.toFixed(2)} cores busy of ${tr.cores} (${Math.round(100*u/tr.cores)}%)`}
+ if(html){tip.innerHTML=html;tip.style.display='block';tip.style.left=Math.min(p.x+14,W-200)+'px';tip.style.top=(p.y+14)+'px'}else tip.style.display='none';
+ draw()});
+cv.addEventListener('pointerleave',()=>{hov=null;tip.style.display='none';draw()});
+cv.addEventListener('pointerdown',e=>{drag={x:pos(e).x,a:v0,b:v1};cv.setPointerCapture(e.pointerId)});
+cv.addEventListener('pointerup',()=>drag=null);cv.addEventListener('pointercancel',()=>drag=null);
+cv.addEventListener('wheel',e=>{e.preventDefault();const f=Math.min(1,Math.max(0,pos(e).f));zoom(v0+f*(v1-v0),f,e.deltaY<0?.8:1.25)},{passive:false});
+function zoom(tc,f,k){const n=Math.max(1,Math.min(tr.duration,(v1-v0)*k));v0=tc-f*n;v1=v0+n;clamp();draw()}
+function clamp(){const n=v1-v0;if(v0<0){v0=0;v1=n}if(v1>tr.duration){v1=tr.duration;v0=Math.max(0,v1-n)}}
+$('#zi').onclick=()=>zoom((v0+v1)/2,.5,.6);$('#zo').onclick=()=>zoom((v0+v1)/2,.5,1.6);$('#zr').onclick=()=>{v0=0;v1=tr.duration;draw()};
+
+function fromText(txt){try{load(JSON.parse(txt))}catch(err){$('#err').textContent='Could not open that trace: '+err.message}}
+function fromFile(f){if(!f)return;const r=new FileReader();r.onload=()=>fromText(r.result);r.readAsText(f)}
+$('#sel').onchange=e=>{$('#err').textContent='';load(SAMPLES[e.target.value])};
+$('#open').onclick=()=>$('#file').click();$('#file').onchange=e=>fromFile(e.target.files[0]);
+['dragover','dragenter'].forEach(ev=>addEventListener(ev,e=>{e.preventDefault();document.body.classList.add('over')}));
+['dragleave','drop'].forEach(ev=>addEventListener(ev,e=>{e.preventDefault();document.body.classList.remove('over')}));
+addEventListener('drop',e=>fromFile(e.dataTransfer.files[0]));
+addEventListener('resize',()=>tr&&fit());
+if(window.matchMedia)matchMedia('(prefers-color-scheme:dark)').addEventListener('change',()=>tr&&draw());
+load(SAMPLES[0]);
+</script>
+</body>
+</html>
